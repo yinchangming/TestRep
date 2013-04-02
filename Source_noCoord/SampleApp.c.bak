@@ -1,0 +1,782 @@
+/**************************************************************************************************
+  Filename:       SampleApp.c
+  Revised:        $Date: 2009-03-18 15:56:27 -0700 (Wed, 18 Mar 2009) $
+  Revision:       $Revision: 19453 $
+
+  Description:    Sample Application (no Profile).
+
+
+
+  Copyright 2007 Texas Instruments Incorporated. All rights reserved.
+
+  IMPORTANT: Your use of this Software is limited to those specific rights
+  granted under the terms of a software license agreement between the user
+  who downloaded the software, his/her employer (which must be your employer)
+  and Texas Instruments Incorporated (the "License").  You may not use this
+  Software unless you agree to abide by the terms of the License. The License
+  limits your use, and you acknowledge, that the Software may not be modified,
+  copied or distributed unless embedded on a Texas Instruments microcontroller
+  or used solely and exclusively in conjunction with a Texas Instruments radio
+  frequency transceiver, which is integrated into your product.  Other than for
+  the foregoing purpose, you may not use, reproduce, copy, prepare derivative
+  works of, modify, distribute, perform, display or sell this Software and/or
+  its documentation for any purpose.
+
+  YOU FURTHER ACKNOWLEDGE AND AGREE THAT THE SOFTWARE AND DOCUMENTATION ARE
+  PROVIDED 揂S IS?WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+  INCLUDING WITHOUT LIMITATION, ANY WARRANTY OF MERCHANTABILITY, TITLE,
+  NON-INFRINGEMENT AND FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL
+  TEXAS INSTRUMENTS OR ITS LICENSORS BE LIABLE OR OBLIGATED UNDER CONTRACT,
+  NEGLIGENCE, STRICT LIABILITY, CONTRIBUTION, BREACH OF WARRANTY, OR OTHER
+  LEGAL EQUITABLE THEORY ANY DIRECT OR INDIRECT DAMAGES OR EXPENSES
+  INCLUDING BUT NOT LIMITED TO ANY INCIDENTAL, SPECIAL, INDIRECT, PUNITIVE
+  OR CONSEQUENTIAL DAMAGES, LOST PROFITS OR LOST DATA, COST OF PROCUREMENT
+  OF SUBSTITUTE GOODS, TECHNOLOGY, SERVICES, OR ANY CLAIMS BY THIRD PARTIES
+  (INCLUDING BUT NOT LIMITED TO ANY DEFENSE THEREOF), OR OTHER SIMILAR COSTS.
+
+  Should you have any questions regarding your right to use this Software,
+  contact Texas Instruments Incorporated at www.TI.com.
+**************************************************************************************************/
+
+/*********************************************************************
+  This application isn't intended to do anything useful, it is
+  intended to be a simple example of an application's structure.
+
+  This application sends it's messages either as broadcast or
+  broadcast filtered group messages.  The other (more normal)
+  message addressing is unicast.  Most of the other sample
+  applications are written to support the unicast message model.
+
+  Key control:
+    SW1:  Sends a flash command to all devices in Group 1.
+    SW2:  Adds/Removes (toggles) this device in and out
+          of Group 1.  This will enable and disable the
+          reception of the flash command.
+*********************************************************************/
+
+/*********************************************************************
+ * INCLUDES
+ */
+#include "OSAL.h"
+#include "ZGlobals.h"
+#include "AF.h"
+#include "aps_groups.h"
+#include "ZDApp.h"
+
+#include "SampleApp.h"
+#include "SampleAppHw.h"
+
+#include "OnBoard.h"
+
+/* HAL */
+#include "hal_lcd.h"
+#include "hal_led.h"
+#include "hal_key.h"
+#include "string.h"
+#include "MT_UART.h"
+#include "sensorcon.h"
+#include "HAL_ADC.h"
+
+/*********************************************************************
+ * MACROS
+ */
+
+/*********************************************************************
+ * CONSTANTS
+ */
+
+/*********************************************************************
+ * TYPEDEFS
+ */
+
+/*********************************************************************
+ * GLOBAL VARIABLES
+ */
+
+// This list should be filled with Application specific Cluster IDs.
+const cId_t SampleApp_ClusterList[SAMPLEAPP_MAX_CLUSTERS] =
+{
+  SAMPLEAPP_PERIODIC_CLUSTERID,
+  SAMPLEAPP_FLASH_CLUSTERID
+};
+
+const SimpleDescriptionFormat_t SampleApp_SimpleDesc =
+{
+  SAMPLEAPP_ENDPOINT,              //  int Endpoint;
+  SAMPLEAPP_PROFID,                //  uint16 AppProfId[2];
+  SAMPLEAPP_DEVICEID,              //  uint16 AppDeviceId[2];
+  SAMPLEAPP_DEVICE_VERSION,        //  int   AppDevVer:4;
+  SAMPLEAPP_FLAGS,                 //  int   AppFlags:4;
+  SAMPLEAPP_MAX_CLUSTERS,          //  uint8  AppNumInClusters;
+  (cId_t *)SampleApp_ClusterList,  //  uint8 *pAppInClusterList;
+  SAMPLEAPP_MAX_CLUSTERS,          //  uint8  AppNumInClusters;
+  (cId_t *)SampleApp_ClusterList   //  uint8 *pAppInClusterList;
+};
+
+// This is the Endpoint/Interface description.  It is defined here, but
+// filled-in in SampleApp_Init().  Another way to go would be to fill
+// in the structure here and make it a "const" (in code space).  The
+// way it's defined in this sample app it is define in RAM.
+endPointDesc_t SampleApp_epDesc;
+
+/*********************************************************************
+ * EXTERNAL VARIABLES
+ */
+
+/*********************************************************************
+ * EXTERNAL FUNCTIONS
+ */
+
+/*********************************************************************
+ * LOCAL VARIABLES
+ */
+uint8 SampleApp_TaskID;   // Task ID for internal task/event processing
+                          // This variable will be received when
+                          // SampleApp_Init() is called.
+devStates_t SampleApp_NwkState;
+
+uint8 SampleApp_TransID;  // This is the unique message ID (counter)
+
+
+
+uint8 *ieeeAddr;//物理地址
+
+
+union h{
+  uint8 RxBuf[32];
+  struct RFRXBUF
+  {
+  	uint8 Head;       //头
+        uint8 HeadCom[3]; //命令头
+        uint8 Laddr[8];
+        uint8 Saddr[2];
+        uint8 DataBuf[16];  //数据缓冲区
+        uint8 CRC;    //校验位
+  	uint8 LastByte;//帧尾
+  }RXDATA;
+}RfRx;//无线接收缓冲区
+
+
+union j{
+  uint8 TxBuf[32];
+  struct RFTXBUF
+  {
+  	uint8 Head;       //头
+        uint8 HeadCom[3]; //命令头
+        uint8 Laddr[8];
+        uint8 Saddr[2];
+        uint8 DataBuf[16];  //数据缓冲区
+        uint8 CRC;    //校验位
+  	uint8 LastByte;//帧尾
+  }TXDATA;
+}RfTx;//无线发送缓冲区
+
+29
+
+/*********************************************************************
+ * LOCAL FUNCTIONS
+ */
+void SampleApp_HandleKeys( uint8 shift, uint8 keys );
+void SampleApp_MessageMSGCB( afIncomingMSGPacket_t *pckt );
+uint8 SendData( uint16 addr, uint8 *buf, uint8 Leng);
+void UartRxComCallBack(void);
+uint8 CheckUartData(uint8 *arr, uint8 n);
+void WaitUs(uint16 microSecs);
+/*********************************************************************
+ * NETWORK LAYER CALLBACKS
+ */
+
+/*********************************************************************
+ * PUBLIC FUNCTIONS
+ */
+
+
+/*****************************************************************************
+  void WaitUs(uint16 microSecs)
+
+  延时uS函数.
+*****************************************************************************/
+void WaitUs(uint16 microSecs)
+{
+  while(microSecs--)
+  {
+    /* 32 NOPs == 1 usecs */
+    asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
+    asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
+    asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
+    asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
+    asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
+    asm("nop"); asm("nop"); asm("nop"); asm("nop"); asm("nop");
+    asm("nop"); asm("nop");
+  }
+}
+
+
+
+/*****************************************************************************
+  void UartOutNetDis(void)
+
+  发送一组数据.
+*****************************************************************************/
+uint8 SendData( uint16 addr, uint8 *buf, uint8 Leng)
+{
+	afAddrType_t SendDataAddr;
+	
+	SendDataAddr.addrMode = (afAddrMode_t)Addr16Bit;
+	SendDataAddr.endPoint = SAMPLEAPP_ENDPOINT;
+	SendDataAddr.addr.shortAddr = addr;
+        if ( AF_DataRequest( &SendDataAddr, &SampleApp_epDesc,
+                       2,//SAMPLEAPP_PERIODIC_CLUSTERID,
+                       Leng,
+                       buf,
+                       &SampleApp_TransID,
+                       AF_DISCV_ROUTE,
+                     //  AF_ACK_REQUEST,
+                       AF_DEFAULT_RADIUS ) == afStatus_SUCCESS )
+	{
+		return 1;
+	}
+	else
+	{
+		return 0;// Error occurred in request to send.
+	}
+}
+
+
+
+/*****************************************************************************
+  uint8 CheckUartData(uint8 *arr, uint8 n)
+
+  数据校验,这里做的是加和校验，正确返回1,错误返回0
+*****************************************************************************/
+uint8 CheckUartData(uint8 *arr, uint8 n)
+{
+	uint8 sum=0;
+	uint8 i;
+	for(i=0; i<n; i++)
+	{
+		sum += *arr;
+		arr++;
+	}
+	return sum;
+}
+
+
+
+/*********************************************************************
+ * @fn      SampleApp_Init
+ *
+ * @brief   Initialization function for the Generic App Task.
+ *          This is called during initialization and should contain
+ *          any application specific initialization (ie. hardware
+ *          initialization/setup, table initialization, power up
+ *          notificaiton ... ).
+ *
+ * @param   task_id - the ID assigned by OSAL.  This ID should be
+ *                    used to send messages and set timers.
+ *
+ * @return  none
+ */
+void SampleApp_Init( uint8 task_id )
+{
+  SampleApp_TaskID = task_id;
+  SampleApp_NwkState = DEV_INIT;
+  SampleApp_TransID = 0;
+
+  // Device hardware initialization can be added here or in main() (Zmain.c).
+  // If the hardware is application specific - add it here.
+  // If the hardware is other parts of the device add it in main().
+
+
+#if defined ( HOLD_AUTO_START )
+  // HOLD_AUTO_START is a compile option that will surpress ZDApp
+  //  from starting the device and wait for the application to
+  //  start the device.
+  ZDOInitDevice(0);
+#endif
+
+  // Fill out the endpoint description.
+  SampleApp_epDesc.endPoint = SAMPLEAPP_ENDPOINT;
+  SampleApp_epDesc.task_id = &SampleApp_TaskID;
+  SampleApp_epDesc.simpleDesc
+            = (SimpleDescriptionFormat_t *)&SampleApp_SimpleDesc;
+  SampleApp_epDesc.latencyReq = noLatencyReqs;
+
+  // Register the endpoint description with the AF
+  afRegister( &SampleApp_epDesc );
+
+  // Register for all key events - This app will handle all key events
+  RegisterForKeys( SampleApp_TaskID );
+}
+
+/*********************************************************************
+ * @fn      SampleApp_ProcessEvent
+ *
+ * @brief   Generic Application Task event processor.  This function
+ *          is called to process all events for the task.  Events
+ *          include timers, messages and any other user defined events.
+ *
+ * @param   task_id  - The OSAL assigned task ID.
+ * @param   events - events to process.  This is a bit map and can
+ *                   contain more than one event.
+ *
+ * @return  none
+ */
+uint16 SampleApp_ProcessEvent( uint8 task_id, uint16 events )
+{
+	afIncomingMSGPacket_t *MSGpkt;
+        
+#if (defined(WXL_ROUTER) || defined(WXL_RFD))//ROUTER OR RFD
+	uint16 SrcSaddr;
+#endif
+	
+	(void)task_id;  // Intentionally unreferenced parameter
+
+	if ( events & SYS_EVENT_MSG )
+	{
+		MSGpkt = (afIncomingMSGPacket_t *)osal_msg_receive( SampleApp_TaskID );
+		while ( MSGpkt )
+		{
+			switch ( MSGpkt->hdr.event )
+			{
+				// Received when a key is pressed
+				case KEY_CHANGE:
+					SampleApp_HandleKeys( ((keyChange_t *)MSGpkt)->state, ((keyChange_t *)MSGpkt)->keys );
+					break;
+
+				// Received when a messages is received (OTA) for this endpoint
+				case AF_INCOMING_MSG_CMD:
+					SampleApp_MessageMSGCB( MSGpkt );
+					break;
+
+				// Received whenever the device changes state in the network
+				case ZDO_STATE_CHANGE:
+					SampleApp_NwkState = (devStates_t)(MSGpkt->hdr.status);
+					if ( (SampleApp_NwkState == DEV_ZB_COORD)
+						|| (SampleApp_NwkState == DEV_ROUTER)
+						|| (SampleApp_NwkState == DEV_END_DEVICE) )
+					{
+			
+#ifdef	WXL_RFD
+						Sensor_PIN_INT();//初始化传感器I/O口
+						HalLedSet( HAL_LED_1,HAL_LED_MODE_ON );//开
+						
+						RfTx.TXDATA.Head = '&';
+						memset(RfTx.TxBuf,'x',32);
+						RfTx.TXDATA.HeadCom[0] = 'J';
+						RfTx.TXDATA.HeadCom[1] = 'O';
+						RfTx.TXDATA.HeadCom[2] = 'N';
+						ieeeAddr = NLME_GetExtAddr();
+						memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+                                       		SrcSaddr = NLME_GetShortAddr();
+						RfTx.TXDATA.Saddr[0] = SrcSaddr;
+                                        	RfTx.TXDATA.Saddr[1] = SrcSaddr>>8;
+						RfTx.TXDATA.DataBuf[0] = 'R';
+						RfTx.TXDATA.DataBuf[1] = 'F';
+						RfTx.TXDATA.DataBuf[2] = 'D';
+						RfTx.TXDATA.LastByte = '*';
+						SendData(0x0000, RfTx.TxBuf, 32);//发送自己的节点信息到主机
+#endif
+						
+#ifdef	WXL_ROUTER
+						Sensor_PIN_INT();//初始化传感器I/O口
+                                                HalLedSet( HAL_LED_1,HAL_LED_MODE_ON );//开
+						
+						memset(RfTx.TxBuf,'x',32);
+						RfTx.TXDATA.Head = '&';
+						RfTx.TXDATA.HeadCom[0] = 'J';
+						RfTx.TXDATA.HeadCom[1] = 'O';
+						RfTx.TXDATA.HeadCom[2] = 'N';
+						ieeeAddr = NLME_GetExtAddr();
+						memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+						SrcSaddr = NLME_GetShortAddr();
+						RfTx.TXDATA.Saddr[0] = SrcSaddr;
+	                                        RfTx.TXDATA.Saddr[1] = SrcSaddr>>8;
+						RfTx.TXDATA.DataBuf[0] = 'R';
+						RfTx.TXDATA.DataBuf[1] = 'O';
+						RfTx.TXDATA.DataBuf[2] = 'U';
+						RfTx.TXDATA.LastByte = '*';
+						SendData(0x0000, RfTx.TxBuf, 32);//发送自己的节点信息到主机
+#endif		
+					}
+					break;
+				
+				case SPI_INCOMING_ZTOOL_PORT:
+				
+					UartRxComCallBack();//串口收到一帖数据的处理
+					
+					break;
+				default:
+					break;
+			}
+
+			// Release the memory
+			osal_msg_deallocate( (uint8 *)MSGpkt );
+
+			// Next - if one is available
+			MSGpkt = (afIncomingMSGPacket_t *)osal_msg_receive( SampleApp_TaskID );
+		}
+
+		// return unprocessed events
+		return (events ^ SYS_EVENT_MSG);
+	}
+
+	// Send a message out - This event is generated by a timer
+	//  (setup in SampleApp_Init()).
+	if ( events & SAMPLEAPP_SEND_PERIODIC_MSG_EVT )//发送数据超时
+	{
+		return (events ^ SAMPLEAPP_SEND_PERIODIC_MSG_EVT);
+	}
+	// Discard unknown events
+	return 0;
+}
+
+/*********************************************************************
+ * Event Generation Functions
+ */
+/*********************************************************************
+ * @fn      SampleApp_HandleKeys
+ *
+ * @brief   Handles all key events for this device.
+ *
+ * @param   shift - true if in shift/alt.
+ * @param   keys - bit field for key events. Valid entries:
+ *                 HAL_KEY_SW_2
+ *                 HAL_KEY_SW_1
+ *
+ * @return  none
+ */
+void SampleApp_HandleKeys( uint8 shift, uint8 keys )
+{
+	(void)shift;  // Intentionally unreferenced parameter
+  
+	if ( keys & HAL_KEY_SW_7 )//按键1
+	{
+		RfTx.TXDATA.Head = '&';
+		memset(RfTx.TxBuf,'x',32);
+		RfTx.TXDATA.HeadCom[0] = 'P';
+		RfTx.TXDATA.HeadCom[1] = 'R';
+		RfTx.TXDATA.HeadCom[2] = 'E';
+						
+		memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+		
+		RfTx.TXDATA.DataBuf[0] = 'S';
+		RfTx.TXDATA.DataBuf[1] = '1';
+		RfTx.TXDATA.LastByte = '*';
+
+		SendData(0x0000, RfTx.TxBuf, 32);//发送按键数据
+	}
+
+	if ( keys & HAL_KEY_SW_6 )//按键2
+	{
+		RfTx.TXDATA.Head = '&';
+		memset(RfTx.TxBuf,'x',32);
+		RfTx.TXDATA.HeadCom[0] = 'P';
+		RfTx.TXDATA.HeadCom[1] = 'R';
+		RfTx.TXDATA.HeadCom[2] = 'E';
+						
+		memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+		
+		RfTx.TXDATA.DataBuf[0] = 'S';
+		RfTx.TXDATA.DataBuf[1] = '2';
+
+		SendData(0x0000, RfTx.TxBuf, 32);//发送按键数据
+	}
+}
+
+/*********************************************************************
+ * LOCAL FUNCTIONS
+ */
+
+/*********************************************************************
+ * @fn      SampleApp_MessageMSGCB
+ *
+ * @brief   Data message processor callback.  This function processes
+ *          any incoming data - probably from other devices.  So, based
+ *          on cluster ID, perform the intended action.
+ *
+ * @param   none
+ *
+ * @return  none
+ */
+void SampleApp_MessageMSGCB( afIncomingMSGPacket_t *pkt )
+{
+#if (defined(WXL_ROUTER) || defined(WXL_RFD))//ROUTER OR RFD
+	uint8 temp;
+	uint16 temp1;
+        float tt;
+	uint8 RfHaveTxDara = 0;//无线有数据需要发送
+	
+	memcpy(RfRx.RxBuf,pkt->cmd.Data,32);
+	switch(RfRx.RXDATA.HeadCom[0])
+	{
+			case 'R'://读
+				if((RfRx.RXDATA.HeadCom[1] == 'A') && (RfRx.RXDATA.HeadCom[2] == 'S'))//读传感器
+				{
+					if((RfRx.RXDATA.DataBuf[0] == 'W') && (RfRx.RXDATA.DataBuf[1] == 'D'))//读温度
+					{
+						SensorPowerOn();//打开传感器电源
+						SET_ADC_IO_ADC_MODE();
+						P2DIR |= (1<<0);
+						P1DIR |= (1<<5);
+						P2    |= (1<<0);
+						P1    |= (1<<5);//SCK和CS的处理
+
+						WaitUs(50000);
+						WaitUs(50000);
+						WaitUs(50000);
+						WaitUs(50000);
+						WaitUs(50000);
+						WaitUs(50000);//延时300ms
+
+						memset(RfTx.TxBuf,'x',32);
+						RfTx.TXDATA.HeadCom[0] = 'R';
+						RfTx.TXDATA.HeadCom[1] = 'A';
+						RfTx.TXDATA.HeadCom[2] = 'S';
+						
+						memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+	
+						RfTx.TXDATA.DataBuf[0] = 'W';
+						RfTx.TXDATA.DataBuf[1] = 'D';
+						ReadTc77();
+						WaitUs(5000);
+						temp = ReadTc77();
+						RfTx.TXDATA.DataBuf[2] = temp/10 + 0x30;
+						RfTx.TXDATA.DataBuf[3] = temp%10 + 0x30;
+						
+						RfHaveTxDara = 1;
+						
+						SensorPowerOff();//关闭传感器电源
+						P2DIR &= ~(1<<0);
+						P1DIR &= ~(1<<5);
+						P2    &= ~(1<<0);
+						P1    &= ~(1<<5);//SCK和CS的处理
+						
+					}
+					else if((RfRx.RXDATA.DataBuf[0] == 'G') && (RfRx.RXDATA.DataBuf[1] == 'M'))//读光敏
+					{
+						SensorPowerOn();//打开传感器电源
+						WaitUs(5000);
+						memset(RfTx.TxBuf,'x',32);
+						RfTx.TXDATA.HeadCom[0] = 'R';
+						RfTx.TXDATA.HeadCom[1] = 'A';
+						RfTx.TXDATA.HeadCom[2] = 'S';
+						
+						
+	                                        memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+                                                
+						RfTx.TXDATA.DataBuf[0] = 'G';
+						RfTx.TXDATA.DataBuf[1] = 'M';
+			
+						temp1 = (uint16)HalAdcRead(ADC_GM,HAL_ADC_RESOLUTION_12);
+								
+	                                        temp = temp1>>4;
+						RfTx.TXDATA.DataBuf[2] = temp/100 + 0x30;
+						temp = temp%100;
+						RfTx.TXDATA.DataBuf[3] = temp/10 + 0x30;
+						RfTx.TXDATA.DataBuf[4] = temp%10 + 0x30;
+						
+						RfHaveTxDara = 1;
+						
+						SET_ADC_IO_SLEEP_MODE();
+						SensorPowerOff();//关闭传感器电源
+					}
+				}
+				else if((RfRx.RXDATA.HeadCom[1] == 'A') && (RfRx.RXDATA.HeadCom[2] == 'C'))//加速度
+				{
+					SensorPowerOn();//打开传感器电源
+					SET_ADC_IO_ADC_MODE();
+					ACC_NOMAL();//使能加速度传感器
+					
+					WaitUs(5000);
+					
+					memset(RfTx.TxBuf,'x',32);
+					RfTx.TXDATA.HeadCom[0] = 'R';
+					RfTx.TXDATA.HeadCom[1] = 'A';
+					RfTx.TXDATA.HeadCom[2] = 'C';
+						
+					memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+                                        
+					if(RfRx.RXDATA.DataBuf[0] == 'X')//X方向
+					{
+						RfTx.TXDATA.DataBuf[0] = 'X';
+						temp1 = (uint16)HalAdcRead(ACC_X,HAL_ADC_RESOLUTION_12);
+					}
+					else if(RfRx.RXDATA.DataBuf[0] == 'Y')//Y方向
+					{
+						RfTx.TXDATA.DataBuf[0] = 'Y';
+						temp1 = (uint16)HalAdcRead(ACC_Y,HAL_ADC_RESOLUTION_12);
+					}
+					else if(RfRx.RXDATA.DataBuf[0] == 'Z')//Z方向
+					{
+						RfTx.TXDATA.DataBuf[0] = 'Z';
+						temp1 = (uint16)HalAdcRead(ACC_Z,HAL_ADC_RESOLUTION_12);
+					}
+					temp = temp1>>4;
+					RfTx.TXDATA.DataBuf[1] = temp/100 +'0';
+					temp %= 100;
+					RfTx.TXDATA.DataBuf[2] = temp/10 + '0';
+					RfTx.TXDATA.DataBuf[3] = temp%10 + '0';
+						
+					RfHaveTxDara = 1;
+					
+					ACC_SLEEP(); //加速度传感器进入休眠模式
+					SET_ADC_IO_SLEEP_MODE();
+					SensorPowerOff();//关闭传感器电源
+				}
+				else if((RfRx.RXDATA.HeadCom[1] == 'N') && (RfRx.RXDATA.HeadCom[2] == 'S'))//读模块连接状态
+				{
+					memset(RfTx.TxBuf,'x',32);
+					RfTx.TXDATA.HeadCom[0] = 'R';
+					RfTx.TXDATA.HeadCom[1] = 'N';
+					RfTx.TXDATA.HeadCom[2] = 'S';
+					
+					memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);
+				
+					temp = pkt->LinkQuality;//读LQI
+
+					RfTx.TXDATA.DataBuf[0] = temp/100 + 0x30;
+                                	temp %= 100;
+                                	RfTx.TXDATA.DataBuf[1] = temp/10 + 0x30;
+                                	RfTx.TXDATA.DataBuf[2] = temp%10 + 0x30;
+
+                                	NLME_GetCoordExtAddr(&RfTx.TXDATA.DataBuf[3]);
+                                	temp1 = NLME_GetCoordShortAddr();//读父节点短地址
+
+                                	RfTx.TXDATA.DataBuf[11] = temp1>>8;
+                                	RfTx.TXDATA.DataBuf[12] = temp1;
+                                	
+					RfHaveTxDara = 1;
+				}//end 读模块连接状态
+				
+			break;
+			
+			case 'T'://测试
+				if((RfRx.RXDATA.HeadCom[1] == 'L') && (RfRx.RXDATA.HeadCom[2] == 'D'))//LED测试
+				{
+					if(RfRx.RXDATA.DataBuf[0] == 'C')//控制灯开关
+					{
+						if((RfRx.RXDATA.DataBuf[1] == 'D') && (RfRx.RXDATA.DataBuf[2] == '1'))
+						{
+							if(RfRx.RXDATA.DataBuf[3] == '1')
+							{
+								HalLedSet( HAL_LED_1,HAL_LED_MODE_ON );//开
+							}
+							else if(RfRx.RXDATA.DataBuf[3] == '0')
+							{
+								HalLedSet( HAL_LED_1,HAL_LED_MODE_OFF );//关
+							}
+						}
+						else if((RfRx.RXDATA.DataBuf[1] == 'D') && (RfRx.RXDATA.DataBuf[2] == '2'))
+						{
+							if(RfRx.RXDATA.DataBuf[3] == '1')
+							{
+								HalLedSet( HAL_LED_2,HAL_LED_MODE_ON );//开
+							}
+							else if(RfRx.RXDATA.DataBuf[3] == '0')
+							{
+								HalLedSet( HAL_LED_2,HAL_LED_MODE_OFF );//关
+							}
+						}
+					}//end if(RfRx.RXDATA.DataBuf[0] == 'C')
+	                                else if(RfRx.RXDATA.DataBuf[0] == 'T')//控制灯的闪烁
+	                                {
+	                                	if((RfRx.RXDATA.DataBuf[1] == 'D') && (RfRx.RXDATA.DataBuf[2] == '1'))//控制LED1
+						{
+							if(RfRx.RXDATA.DataBuf[3] == '1')
+							{
+								HalLedSet( HAL_LED_1,HAL_LED_MODE_FLASH );//开始闪烁
+							}
+							else if(RfRx.RXDATA.DataBuf[3] == '0')
+							{
+								HalLedSet( HAL_LED_1,HAL_LED_MODE_OFF );//关
+							}
+						}
+						else if((RfRx.RXDATA.DataBuf[1] == 'D') && (RfRx.RXDATA.DataBuf[2] == '2'))//控制LED2
+						{
+							if(RfRx.RXDATA.DataBuf[3] == '1')
+							{
+								HalLedSet( HAL_LED_2,HAL_LED_MODE_FLASH );//开始闪烁
+							}
+							else if(RfRx.RXDATA.DataBuf[3] == '0')
+							{
+								HalLedSet( HAL_LED_2,HAL_LED_MODE_OFF );//关
+							}
+						}
+					}
+					memset(RfTx.TxBuf,'x',32);
+					RfTx.TXDATA.HeadCom[0] = 'T';
+					RfTx.TXDATA.HeadCom[1] = 'L';
+					RfTx.TXDATA.HeadCom[2] = 'D';
+					
+					memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);		
+					
+					RfTx.TXDATA.DataBuf[0] = 'O';
+					RfTx.TXDATA.DataBuf[1] = 'K';
+					
+					RfHaveTxDara = 1;
+	
+				}//end LED测试
+				else if((RfRx.RXDATA.HeadCom[1] == 'B') && (RfRx.RXDATA.HeadCom[2] == 'L'))//测试电池电压
+				{
+					//SensorPowerOn();//打开传感器电源
+					WaitUs(5000);
+					
+					memset(RfTx.TxBuf,'x',32);
+					RfTx.TXDATA.HeadCom[0] = 'T';
+					RfTx.TXDATA.HeadCom[1] = 'B';
+					RfTx.TXDATA.HeadCom[2] = 'L';
+							
+					memcpy(RfTx.TXDATA.Laddr,ieeeAddr,8);		
+                                        
+	                                temp1 = HalAdcReadVdd();
+                                        
+                                        tt = (float)temp1;
+                                        /*
+					* value now contains measurement of Vdd/3
+					* 0 indicates 0V and 32767 indicates 1.25V
+					* voltage = (value*3*1.25)/32767 volts
+					* we will multiply by this by 10 to allow units of 0.1 volts
+					*/
+				
+					tt = tt*3.66;
+                                        tt = tt/3276.7;
+                                        
+                                        
+	                                temp = (uint8)tt;
+	                                
+					RfTx.TXDATA.DataBuf[0] = temp/10 + '0';
+					RfTx.TXDATA.DataBuf[1] = '.';
+					RfTx.TXDATA.DataBuf[2] = temp%10 + '0';
+					RfTx.TXDATA.DataBuf[3] = 'V';
+					
+					RfHaveTxDara = 1;
+					
+					//SensorPowerOff();//关闭传感器电源
+				}
+			break;
+	}
+	if(RfHaveTxDara)//如果有数据要发送
+	{
+		RfHaveTxDara = 0;
+		RfTx.TXDATA.Head = '&';
+		RfTx.TXDATA.LastByte = '*';
+		SendData(0x0000, RfTx.TxBuf, 32);//发送数据
+	}
+#endif	
+}
+
+
+/*****************************************************************************
+  UartRxComCallBack
+
+  串口接收到命令处理函数
+*****************************************************************************/
+void UartRxComCallBack(void)
+{
+	;
+}
+
+
+/*********************************************************************
+*********************************************************************/
